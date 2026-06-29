@@ -12,15 +12,29 @@ app.get('/search', async (req, res) => {
     const query = req.query.q;
     if (!query) return res.status(400).json({ error: 'Digite o nome da música.' });
 
-    try {
-        // O Render hospeda isso nos EUA, então a API do JioSaavn não bloqueia o acesso!
-        const response = await fetch(`https://saavn.dev/api/search/songs?query=${encodeURIComponent(query)}`);
-        const data = await response.json();
-        res.json(data);
-    } catch (error) {
-        console.error("Erro na busca:", error);
-        res.status(500).json({ error: 'Falha na comunicação com a API de música.' });
+    // Sistema de Espelhos (Fallbacks) - Se um falhar, tenta o próximo!
+    const apis = [
+        `https://saavn.echomusic.fun/api/search/songs?query=${encodeURIComponent(query)}`,
+        `https://jiosaavn-api-sigma-sandy.vercel.app/api/search/songs?query=${encodeURIComponent(query)}`,
+        `https://saavn.me/search/songs?query=${encodeURIComponent(query)}`
+    ];
+
+    for (const url of apis) {
+        try {
+            const response = await fetch(url);
+            const data = await response.json();
+            
+            // Verifica se a API retornou resultados válidos
+            if (data && data.data && data.data.results && data.data.results.length > 0) {
+                return res.json(data); // Se funcionou, devolve a música e para de procurar!
+            }
+        } catch (error) {
+            console.error(`O espelho falhou (tentando o próximo): ${url}`);
+        }
     }
+
+    // Se o código chegar aqui, é porque todos os servidores globais caíram
+    res.status(500).json({ error: 'Todos os servidores globais falharam no momento.' });
 });
 
 // --- ROTA 2: STREAMING (Contorna o CORS e protege o formato do áudio) ---
