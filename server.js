@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const yts = require('yt-search');
 const { Readable } = require('stream');
+const ytdl = require('@distube/ytdl-core');
 
 const app = express();
 
@@ -85,52 +86,54 @@ app.get('/stream', async (req, res) => {
         return res.redirect(videoId); // Se o proxy falhar numa emergência absoluta, faz o redirect antigo
     }
 
-    // Instâncias do Piped Atualizadas, Mais Estáveis
-    const pipedInstances = [
-        'https://pipedapi.kavin.rocks',
-        'https://api.piped.projectsegfau.lt',
-        'https://pipedapi.smnz.de',
-        'https://piped-api.lunar.icu'
+    try {
+        const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        const info = await ytdl.getInfo(videoUrl);
+        
+        // Prioriza apenas o áudio para máxima economia de dados
+        const format = ytdl.chooseFormat(info.formats, { quality: 'highestaudio', filter: 'audioonly' });
+
+        if (format && format.url) {
+            console.log(`[SUCESSO] Extração nativa ytdl para: ${videoId}`);
+            const success = await proxyStream(format.url, req, res);
+            if (success) return;
+        }
+    } catch (err) {
+        console.log(`[AVISO] Extração nativa falhou para ${videoId}:`, err.message);
+    }
+
+    // Endpoints mais estáveis para extração crua de dados
+    const invidiousInstances = [
+        'https://inv.tux.pizza',
+        'https://invidious.jing.rocks',
+        'https://invidious.nerdvpn.de',
+        'https://invidious.no-logs.com'
     ];
 
-    // Tenta encontrar a URL direta do áudio
-    for (const api of pipedInstances) {
+    for (const api of invidiousInstances) {
         try {
-            // Adiciona um timeout pequeno (4s) para não prender o utilizador se uma API estiver lenta
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 4000);
+            const timeoutId = setTimeout(() => controller.abort(), 4500); // 4.5s limite
 
-            const response = await fetch(`${api}/streams/${videoId}`, { signal: controller.signal });
+            const response = await fetch(`${api}/api/v1/videos/${videoId}`, { signal: controller.signal });
             clearTimeout(timeoutId);
 
             if (!response.ok) continue;
-            
+
             const data = await response.json();
-            
-            if (data.audioStreams && data.audioStreams.length > 0) {
-                const bestAudio = data.audioStreams.find(s => s.mimeType === 'audio/mp4') || data.audioStreams[0];
-                
-                // Em vez do antigo `res.redirect`, agora puxamos e retransmitimos! (Sem bloqueios CORS)
-                const success = await proxyStream(bestAudio.url, req, res);
-                if (success) return; 
+            if (data.adaptiveFormats) {
+                const bestAudio = data.adaptiveFormats.find(f => f.type && f.type.startsWith('audio/mp4'))
+                               || data.adaptiveFormats.find(f => f.type && f.type.startsWith('audio/webm'));
+
+                if (bestAudio && bestAudio.url) {
+                    console.log(`[SUCESSO] API Fallback (${api}) funcionou para ${videoId}`);
+                    const success = await proxyStream(bestAudio.url, req, res);
+                    if (success) return;
+                }
             }
         } catch (err) {
-            console.log(`Instância Piped falhou ou demorou muito: ${api}`);
+            console.log(`[AVISO] Fallback falhou ou demorou em: ${api}`);
         }
-    }
-
-    // Se todas as APIs do Piped sofrerem queda simultânea, usa o Invidious, MAS como proxy!
-    // Instâncias atualizadas e a funcionar:
-    const invidiousInstances = [
-        'https://invidious.perennialte.ch',
-        'https://invidious.jing.rocks',
-        'https://iv.melmac.space'
-    ];
-
-    for (const invAPI of invidiousInstances) {
-        const invUrl = `${invAPI}/latest_version?id=${videoId}&itag=140`;
-        const success = await proxyStream(invUrl, req, res);
-        if (success) return;
     }
 
     res.status(500).send('Erro Global: Nenhuma fonte de áudio conseguiu ser carregada.');
