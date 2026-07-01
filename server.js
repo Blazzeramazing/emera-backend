@@ -1,8 +1,11 @@
 const express = require('express');
 const cors = require('cors');
 const yts = require('yt-search');
-const { Readable } = require('stream');
 const ytdl = require('@distube/ytdl-core');
+
+// Proteção global para o servidor nunca crashar no Railway
+process.on('uncaughtException', (err) => console.error('[CRITICAL] Uncaught Exception:', err));
+process.on('unhandledRejection', (reason) => console.error('[CRITICAL] Unhandled Rejection:', reason));
 
 const app = express();
 
@@ -32,39 +35,32 @@ app.get('/search', async (req, res) => {
     }
 });
 
-// --- FUNÇÃO DE TRANSMISSÃO ROBUSTA ---
+// --- FUNÇÃO DE TRANSMISSÃO ROBUSTA (À PROVA DE CRASH) ---
 async function proxyStream(url, req, res) {
     try {
         const headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             'Accept': '*/*',
-            'Accept-Language': 'pt-PT,pt;q=0.9,en-US;q=0.8,en;q=0.7',
         };
-        
-        if (req.headers.range) {
-            headers['Range'] = req.headers.range;
-        }
+        if (req.headers.range) headers['Range'] = req.headers.range;
 
         const response = await fetch(url, { headers, redirect: 'follow' });
 
         if (!response.ok) {
-            console.log(`[FALHOU] Link recusou ligação. Status: ${response.status}`);
+            console.log(`[REJEITADO] HTTP ${response.status} de ${url.substring(0, 30)}...`);
             return false; 
         }
 
-        // A PISTA DE OURO: Verificar o formato real e o tamanho do ficheiro!
         const contentType = response.headers.get('content-type') || '';
         const contentLength = response.headers.get('content-length');
 
-        // Se for HTML (página de erro camuflada) ou não for áudio/vídeo, REJEITA!
-        if (!contentType.includes('audio') && !contentType.includes('video')) {
-            console.log(`[REJEITADO] Falso Positivo. Formato recebido: ${contentType}`);
-            return false; // Força o salto para o próximo servidor
+        // Se não for media real, ou for demasiado pequeno (página de erro), salta fora!
+        if (!contentType.includes('audio') && !contentType.includes('video') && !contentType.includes('octet-stream')) {
+            console.log(`[REJEITADO] Falso Positivo: ${contentType}`);
+            return false;
         }
-        
-        // Ficheiros com menos de 100KB são páginas de erro 100% das vezes
         if (contentLength && parseInt(contentLength) < 100000) {
-            console.log(`[REJEITADO] Ficheiro demasiado pequeno (${contentLength} bytes). Erro camuflado.`);
+            console.log(`[REJEITADO] Ficheiro demasiado pequeno (${contentLength} bytes)`);
             return false;
         }
 
@@ -74,25 +70,26 @@ async function proxyStream(url, req, res) {
             'Content-Type': contentType,
             'Accept-Ranges': 'bytes',
         });
-
         if (contentLength) res.set('Content-Length', contentLength);
         if (response.headers.get('content-range')) res.set('Content-Range', response.headers.get('content-range'));
 
-        // Extrai o áudio e envia diretamente para o Frontend sem sobrecarregar a memória
-        const stream = Readable.fromWeb(response.body);
-        stream.pipe(res);
-        
-        // Se o utilizador passar à frente na música, cancelamos a transferência antiga
-        req.on('close', () => {
-            stream.destroy();
-            if (response.body && typeof response.body.cancel === 'function') {
-                response.body.cancel().catch(()=>{});
-            }
-        });
+        // Tubagem Universal (Compatível com qualquer versão do Node no Railway)
+        if (response.body && typeof response.body.pipe === 'function') {
+            response.body.pipe(res);
+        } else if (typeof ReadableStream !== 'undefined') {
+            const { Readable } = require('stream');
+            const stream = Readable.fromWeb(response.body);
+            stream.pipe(res);
+            req.on('close', () => { stream.destroy(); });
+        } else {
+            // Em último caso, envia em buffer
+            const buffer = await response.arrayBuffer();
+            res.end(Buffer.from(buffer));
+        }
 
         return true; 
     } catch (error) {
-        console.error('[ERRO PROXY]:', error.message);
+        console.error('[ERRO PROXY STREAM]:', error.message);
         return false; 
     }
 }
@@ -102,34 +99,66 @@ app.get('/stream', async (req, res) => {
     const videoId = req.query.url; 
     if (!videoId) return res.status(400).send('ID ausente');
 
-    // INJEÇÃO DE CORS OBRIGATÓRIA (Garante que os erros 500 chegam limpos ao frontend)
+    // CORS OBRIGATÓRIO (Impede o browser de mentir sobre o erro)
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
-    res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range');
 
     if (req.method === 'OPTIONS') return res.status(200).end();
 
     if (videoId.startsWith('http')) {
-        const success = await proxyStream(videoId, req, res);
-        if (success) return;
+        if (await proxyStream(videoId, req, res)) return;
         return res.redirect(videoId);
     }
 
-    // TENTATIVA 1: Piped APIs (As mais fiáveis, com tempo limite de 8 segundos)
+    console.log(`\n=== INICIANDO EXTRAÇÃO: ${videoId} ===`);
+
+    // TENTATIVA 1: Cobalt Oficial (Atualizado para a API V10 da co.wuk.sh)
+    try {
+        console.log(`[CAMADA 1] A testar API Oficial Cobalt (co.wuk.sh)...`);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 6000); // 6s máx
+        
+        const cobaltRes = await fetch("https://co.wuk.sh/api/json", {
+            method: "POST",
+            headers: {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            },
+            body: JSON.stringify({
+                url: `https://www.youtube.com/watch?v=${videoId}`,
+                isAudioOnly: true
+            }),
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
+        if (cobaltRes.ok) {
+            const cobaltData = await cobaltRes.json();
+            if (cobaltData.url) {
+                console.log(`[SUCESSO] Link gerado pelo Cobalt! A transmitir...`);
+                if (await proxyStream(cobaltData.url, req, res)) return;
+            }
+        } else {
+             console.log(`[FALHA] Cobalt devolveu status: ${cobaltRes.status}`);
+        }
+    } catch(e) {
+        console.log(`[FALHA] Tempo esgotado ou erro no Cobalt.`);
+    }
+
+    // TENTATIVA 2: Instâncias rápidas do Piped (Garantidas)
     const pipedInstances = [
         'https://pipedapi.kavin.rocks',
-        'https://pipedapi.tokhmi.xyz',
-        'https://pipedapi.smnz.de',
-        'https://api.piped.projectsegfau.lt',
-        'https://pipedapi.syncpundit.io'
+        'https://deapi.piped.stream',
+        'https://piped-api.garudalinux.org'
     ];
 
     for (const api of pipedInstances) {
         try {
-            console.log(`[CAMADA 1] A testar Piped: ${api}`);
+            console.log(`[CAMADA 2] A testar Piped: ${api}`);
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 8000); // 8 segundos para dar tempo!
+            const timeoutId = setTimeout(() => controller.abort(), 4000); // 4s rápidos
 
             const response = await fetch(`${api}/streams/${videoId}`, { signal: controller.signal });
             clearTimeout(timeoutId);
@@ -141,86 +170,37 @@ app.get('/stream', async (req, res) => {
                 const bestAudio = data.audioStreams.find(s => s.mimeType && s.mimeType.includes('audio/mp4')) || data.audioStreams[0];
 
                 if (bestAudio && bestAudio.url) {
-                    console.log(`[SUCESSO] Transmitir via Piped!`);
-                    const success = await proxyStream(bestAudio.url, req, res);
-                    if (success) return;
+                    console.log(`[SUCESSO] Link gerado pelo Piped! A transmitir...`);
+                    if (await proxyStream(bestAudio.url, req, res)) return;
                 }
             }
         } catch (err) {
-            console.log(`[AVISO] Falha de tempo no Piped.`);
+            console.log(`[AVISO] Instância Piped saltada (Timeout)`);
         }
     }
 
-    // TENTATIVA 2: Cobalt API (Ferramenta poderosa de extração global)
+    // TENTATIVA 3: ytdl-core nativo (Fallback robusto com cookies padrão)
     try {
-        console.log(`[CAMADA 2] A testar Cobalt API...`);
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 6000);
-        
-        const cobaltRes = await fetch("https://api.cobalt.tools/api/json", {
-            method: "POST",
-            headers: {
-                "Accept": "application/json",
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                url: `https://www.youtube.com/watch?v=${videoId}`,
-                isAudioOnly: true,
-                aFormat: "mp3" // Forçamos o formato MP3 para máxima compatibilidade web
-            }),
-            signal: controller.signal
-        });
-        clearTimeout(timeoutId);
-
-        if (cobaltRes.ok) {
-            const cobaltData = await cobaltRes.json();
-            if (cobaltData.url) {
-                console.log(`[SUCESSO] Transmitir via Cobalt!`);
-                const success = await proxyStream(cobaltData.url, req, res);
-                if (success) return;
-            }
-        }
-    } catch(e) {
-        console.log(`[AVISO] Cobalt API falhou.`);
-    }
-
-    // TENTATIVA 3: Invidious Proxy Local
-    const invidiousInstances = [
-        'https://inv.tux.pizza',
-        'https://invidious.jing.rocks',
-        'https://invidious.nerdvpn.de'
-    ];
-
-    for (const api of invidiousInstances) {
-        try {
-            console.log(`[CAMADA 3] A testar Invidious Proxy: ${api}`);
-            const proxyUrl = `${api}/latest_version?id=${videoId}&itag=140&local=true`;
-            const success = await proxyStream(proxyUrl, req, res);
-            if (success) return;
-        } catch (err) {}
-    }
-
-    // TENTATIVA 4: ytdl-core nativo (Deixado para último pois o YouTube bloqueia muito IPs Cloud)
-    try {
-        console.log(`[CAMADA 4] Extração nativa YTDL-Core...`);
+        console.log(`[CAMADA 3] A testar YTDL-Core nativo...`);
         const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`);
         const format = ytdl.chooseFormat(info.formats, { quality: 'highestaudio', filter: 'audioonly' });
 
         if (format && format.url) {
-            console.log(`[SUCESSO] Transmitir via YTDL!`);
-            const success = await proxyStream(format.url, req, res);
-            if (success) return; 
+            console.log(`[SUCESSO] Extração nativa completa! A transmitir...`);
+            if (await proxyStream(format.url, req, res)) return; 
         }
     } catch (err) {
-        console.log(`[AVISO] YTDL Bloqueado por IP.`);
+        console.log(`[AVISO] YTDL bloqueado pelo YouTube (IP binding)`);
     }
 
-    // SE TUDO FALHAR, envia erro 500 formatado com CORS ativo!
-    console.log(`[FALHA TOTAL] Nenhuma via conseguiu extrair a faixa.`);
-    res.status(500).send('Erro Crítico: Todas as vias de extração de áudio foram bloqueadas.');
+    // SE CHEGAR AQUI, TUDO FALHOU.
+    console.log(`[FALHA TOTAL] Todas as camadas falharam.`);
+    if (!res.headersSent) {
+        res.status(500).send('Erro Crítico: Nenhuma API conseguiu extrair o áudio de forma segura.');
+    }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Backend Supremo rodando na porta ${PORT}`);
+    console.log(`Backend Supremo (V2 Blindada) rodando na porta ${PORT}`);
 });
