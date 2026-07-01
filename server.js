@@ -7,7 +7,7 @@ const http = require('http');
 
 const app = express();
 
-// Proteção Global contra crashes de servidor
+// Previne que o Railway crashe por causa de erros de terceiros
 process.on('uncaughtException', (err) => console.error('[CRITICAL]', err.message));
 process.on('unhandledRejection', (reason) => console.error('[CRITICAL]', reason));
 
@@ -34,83 +34,93 @@ app.get('/search', async (req, res) => {
     }
 });
 
-// --- FUNÇÃO MÁGICA: TÚNEL NATIVO (AGORA COM SUPORTE A RANGE) ---
-function pipeViaNative(url, req, res) {
-    return new Promise((resolve) => {
-        const client = url.startsWith('https') ? https : http;
-        
-        const headers = { 
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': '*/*',
-            'Connection': 'keep-alive'
-        };
-
-        // O SEGREDO DE OURO: Repassar o pedido de pedaços (Range) do navegador para a origem!
-        if (req && req.headers && req.headers.range) {
-            headers['Range'] = req.headers.range;
-        }
-
-        const request = client.get(url, { headers: headers }, (streamRes) => {
-            // Se houver redirecionamento (muito comum em proxies)
-            if (streamRes.statusCode >= 300 && streamRes.statusCode < 400 && streamRes.headers.location) {
-                let redirectUrl = streamRes.headers.location;
-                if (!redirectUrl.startsWith('http')) {
-                    const urlObj = new URL(url);
-                    redirectUrl = `${urlObj.protocol}//${urlObj.host}${redirectUrl}`;
-                }
-                return resolve(pipeViaNative(redirectUrl, req, res)); // Chamada recursiva
-            }
-            
-            // Aceitar 200 (OK) e 206 (Conteúdo Parcial/Música)
-            if (streamRes.statusCode !== 200 && streamRes.statusCode !== 206) {
-                streamRes.resume(); 
-                return resolve(false);
-            }
-            
-            // Proteger contra páginas HTML disfarçadas
-            const contentType = streamRes.headers['content-type'] || '';
-            if (contentType.includes('text/html') || contentType.includes('application/json')) {
-                streamRes.resume();
-                return resolve(false);
-            }
-
-            // Iniciar Transmissão CORS
-            if (!res.headersSent) {
-                res.setHeader('Access-Control-Allow-Origin', '*');
-                res.setHeader('Content-Type', contentType.includes('audio') || contentType.includes('video') ? contentType : 'audio/mpeg');
-                if (streamRes.headers['content-length']) res.setHeader('Content-Length', streamRes.headers['content-length']);
-                
-                // Repassar a confirmação do pedaço (Content-Range) para o navegador não cancelar a ligação
-                if (streamRes.headers['content-range']) res.setHeader('Content-Range', streamRes.headers['content-range']);
-                
-                res.setHeader('Accept-Ranges', 'bytes');
-                res.status(streamRes.statusCode); 
-            }
-
-            streamRes.pipe(res);
-            
-            streamRes.on('end', () => resolve(true));
-            streamRes.on('error', () => resolve(true)); 
-        });
-        
-        request.on('error', () => resolve(false));
-        request.setTimeout(8000, () => { request.destroy(); resolve(false); });
-    });
-}
-
-const fetchWithTimeout = (url, options = {}, timeout = 5000) => {
+const fetchWithTimeout = (url, options = {}, timeout = 3000) => {
     return Promise.race([
         fetch(url, options),
         new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), timeout))
     ]);
 };
 
-// --- ROTA 2: RESOLVEDOR DE STREAM EXTREMO ---
+// --- FUNÇÃO MÁGICA: TÚNEL NATIVO INTELIGENTE ---
+// Retorna 'piped' se comprometeu a resposta ao cliente, ou 'failed_clean' se pudermos tentar outra API
+function pipeViaNative(url, req, res, referer = '') {
+    return new Promise((resolve) => {
+        let headersCommitted = false;
+        const client = url.startsWith('https') ? https : http;
+        
+        const headers = { 
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': '*/*'
+        };
+        if (referer) headers['Referer'] = referer;
+        
+        // Repassa os Range Headers para permitir avançar/recuar a música perfeitamente
+        if (req && req.headers && req.headers.range) {
+            headers['Range'] = req.headers.range;
+        }
+
+        const request = client.get(url, { headers: headers }, (streamRes) => {
+            // Lidar com redirecionamentos (muito comum nas APIs)
+            if (streamRes.statusCode >= 300 && streamRes.statusCode < 400 && streamRes.headers.location) {
+                streamRes.resume(); // Liberta a memória do redirecionamento
+                let redirectUrl = streamRes.headers.location;
+                if (!redirectUrl.startsWith('http')) {
+                    const urlObj = new URL(url);
+                    redirectUrl = `${urlObj.protocol}//${urlObj.host}${redirectUrl}`;
+                }
+                return resolve(pipeViaNative(redirectUrl, req, res, referer)); 
+            }
+            
+            // Rejeita erros da API alvo e páginas bloqueadas
+            if (streamRes.statusCode !== 200 && streamRes.statusCode !== 206) {
+                streamRes.resume(); 
+                return resolve('failed_clean');
+            }
+            
+            // Proteger contra páginas HTML ou JSON disfarçadas de áudio (O Bug dos 15KB)
+            const contentType = streamRes.headers['content-type'] || '';
+            if (contentType.includes('text/html') || contentType.includes('application/json')) {
+                streamRes.resume();
+                return resolve('failed_clean');
+            }
+
+            // Iniciar Transmissão Segura
+            if (!res.headersSent) {
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                res.setHeader('Content-Type', contentType.includes('audio') || contentType.includes('video') ? contentType : 'audio/mpeg');
+                if (streamRes.headers['content-length']) res.setHeader('Content-Length', streamRes.headers['content-length']);
+                if (streamRes.headers['content-range']) res.setHeader('Content-Range', streamRes.headers['content-range']);
+                res.setHeader('Accept-Ranges', 'bytes');
+                res.status(streamRes.statusCode); 
+                headersCommitted = true;
+            }
+
+            // Conecta a mangueira de áudio
+            streamRes.pipe(res);
+            
+            streamRes.on('end', () => resolve('piped'));
+            streamRes.on('error', () => { 
+                // Se a ligação quebrar a meio, fechamos a torneira para o navegador tentar pedir o resto depois!
+                res.end(); 
+                resolve('piped'); 
+            }); 
+        });
+        
+        request.on('error', () => resolve(headersCommitted ? 'piped' : 'failed_clean'));
+        // Timeout anti-travagem (Se o servidor encravar 4 segundos sem dados, corta e testa o próximo)
+        request.setTimeout(4000, () => { 
+            request.destroy(); 
+            resolve(headersCommitted ? 'piped' : 'failed_clean'); 
+        });
+    });
+}
+
+// --- ROTA 2: RESOLVEDOR DE STREAM (PROXY DE 4 CAMADAS) ---
 app.get('/stream', async (req, res) => {
     const videoId = req.query.url; 
     if (!videoId) return res.status(400).send('ID ausente');
     
-    // Suporte a Preflight CORS
+    // Suporte a Preflight CORS exigido pelos navegadores
     if (req.method === 'OPTIONS') {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -118,41 +128,51 @@ app.get('/stream', async (req, res) => {
         return res.status(200).end();
     }
 
+    // Ligações diretas / Fallback Offline
     if (videoId.startsWith('http')) {
-        const success = await pipeViaNative(videoId, req, res);
-        if (!success && !res.headersSent) res.redirect(videoId);
+        const status = await pipeViaNative(videoId, req, res);
+        if (status === 'failed_clean' && !res.headersSent) res.redirect(videoId);
         return;
     }
 
-    // LAYER 1: YTDL-CORE (Nativo)
+    // LAYER 1: COBALT API (Ultra-Rápido, Nova Tecnologia)
     try {
-        const info = await Promise.race([
-            ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`),
-            new Promise((_, r) => setTimeout(() => r(new Error('Timeout')), 4000))
-        ]);
-        const format = ytdl.chooseFormat(info.formats, { quality: 'highestaudio', filter: 'audioonly' });
-        if (format && format.url) {
-            if (await pipeViaNative(format.url, req, res)) return;
+        const cobaltRes = await fetchWithTimeout("https://api.cobalt.tools/api/json", {
+            method: "POST",
+            headers: {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "EmeraPlayer/1.0"
+            },
+            body: JSON.stringify({
+                url: `https://www.youtube.com/watch?v=${videoId}`,
+                isAudioOnly: true
+            })
+        }, 3000);
+        
+        if (cobaltRes.ok) {
+            const data = await cobaltRes.json();
+            if (data && data.url) {
+                const status = await pipeViaNative(data.url, req, res);
+                if (status === 'piped') return; // Se comprometeu, pára de tentar outros!
+            }
         }
-    } catch (e) {}
+    } catch(e) {}
 
-    // LAYER 2: INVIDIOUS API
+    // LAYER 2: INVIDIOUS API (Com Bypass Local de Proxy Integrado)
     const invidiousInstances = [
         "https://inv.tux.pizza",
         "https://invidious.jing.rocks",
         "https://invidious.nerdvpn.de",
-        "https://invidious.lunar.icu"
+        "https://invidious.lunar.icu",
+        "https://invidious.slipfox.xyz",
+        "https://inv.nadeko.net"
     ];
     for (const api of invidiousInstances) {
-        try {
-            const reqFetch = await fetchWithTimeout(`${api}/api/v1/videos/${videoId}`, {}, 2500);
-            if (!reqFetch.ok) continue;
-            const data = await reqFetch.json();
-            const format = data.formatStreams?.find(s => s.mimeType?.includes('audio/mp4')) || data.formatStreams?.[0];
-            if (format && format.url) {
-                if (await pipeViaNative(format.url, req, res)) return;
-            }
-        } catch(e) {}
+        // local=true obriga a instância a mascarar o nosso IP!
+        const proxyUrl = `${api}/latest_version?id=${videoId}&itag=140&local=true`;
+        const status = await pipeViaNative(proxyUrl, req, res);
+        if (status === 'piped') return;
     }
 
     // LAYER 3: PIPED API
@@ -168,16 +188,34 @@ app.get('/stream', async (req, res) => {
             const data = await reqFetch.json();
             const format = data.audioStreams?.find(s => s.mimeType?.includes('audio/mp4')) || data.audioStreams?.[0];
             if (format && format.url) {
-                if (await pipeViaNative(format.url, req, res)) return;
+                const urlObj = new URL(api);
+                const referer = `https://${urlObj.host.replace('pipedapi', 'piped')}/`;
+                const status = await pipeViaNative(format.url, req, res, referer);
+                if (status === 'piped') return;
             }
         } catch(e) {}
     }
 
-    // SE TUDO FALHOU
-    if (!res.headersSent) res.status(500).send('Bloqueio Massivo detectado.');
+    // LAYER 4: YTDL-CORE (Local nativo)
+    try {
+        const info = await Promise.race([
+            ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`),
+            new Promise((_, r) => setTimeout(() => r(new Error('Timeout')), 4000))
+        ]);
+        const format = ytdl.chooseFormat(info.formats, { quality: 'highestaudio', filter: 'audioonly' });
+        if (format && format.url) {
+            const status = await pipeViaNative(format.url, req, res);
+            if (status === 'piped') return;
+        }
+    } catch (e) {}
+
+    // SE ABSOLUTAMENTE TUDO FALHOU E AINDA NÃO ENVIÁMOS NADA
+    if (!res.headersSent) {
+        res.status(500).send('Bloqueio Massivo detectado. Tente novamente mais tarde.');
+    }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Backend TITÃ (Com suporte a Range) rodando na porta ${PORT}`);
+    console.log(`Backend Supremo (Com Prevenção de Concatenação) rodando na porta ${PORT}`);
 });
