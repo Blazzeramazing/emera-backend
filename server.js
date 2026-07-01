@@ -52,14 +52,30 @@ async function proxyStream(url, req, res) {
             return false; 
         }
 
+        // A PISTA DE OURO: Verificar o formato real e o tamanho do ficheiro!
+        const contentType = response.headers.get('content-type') || '';
+        const contentLength = response.headers.get('content-length');
+
+        // Se for HTML (página de erro camuflada) ou não for áudio/vídeo, REJEITA!
+        if (!contentType.includes('audio') && !contentType.includes('video')) {
+            console.log(`[REJEITADO] Falso Positivo. Formato recebido: ${contentType}`);
+            return false; // Força o salto para o próximo servidor
+        }
+        
+        // Ficheiros com menos de 100KB são páginas de erro 100% das vezes
+        if (contentLength && parseInt(contentLength) < 100000) {
+            console.log(`[REJEITADO] Ficheiro demasiado pequeno (${contentLength} bytes). Erro camuflado.`);
+            return false;
+        }
+
         res.status(response.status);
         res.set({
             'Access-Control-Allow-Origin': '*',
-            'Content-Type': response.headers.get('content-type') || 'audio/mp4',
+            'Content-Type': contentType,
             'Accept-Ranges': 'bytes',
         });
 
-        if (response.headers.get('content-length')) res.set('Content-Length', response.headers.get('content-length'));
+        if (contentLength) res.set('Content-Length', contentLength);
         if (response.headers.get('content-range')) res.set('Content-Range', response.headers.get('content-range'));
 
         // Extrai o áudio e envia diretamente para o Frontend sem sobrecarregar a memória
@@ -69,6 +85,9 @@ async function proxyStream(url, req, res) {
         // Se o utilizador passar à frente na música, cancelamos a transferência antiga
         req.on('close', () => {
             stream.destroy();
+            if (response.body && typeof response.body.cancel === 'function') {
+                response.body.cancel().catch(()=>{});
+            }
         });
 
         return true; 
@@ -146,7 +165,8 @@ app.get('/stream', async (req, res) => {
             },
             body: JSON.stringify({
                 url: `https://www.youtube.com/watch?v=${videoId}`,
-                isAudioOnly: true
+                isAudioOnly: true,
+                aFormat: "mp3" // Forçamos o formato MP3 para máxima compatibilidade web
             }),
             signal: controller.signal
         });
