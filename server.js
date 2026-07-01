@@ -6,27 +6,23 @@ const https = require('https');
 
 const app = express();
 
-// Permite que o Front-end (Vercel) acesse este servidor
+// Permite acesso de qualquer Frontend
 app.use(cors({ origin: '*' }));
 
-// --- ROTA 1: PESQUISA NATIVA NO YOUTUBE ---
-// Em vez de usar APIs de terceiros que caem, o próprio servidor 
-// faz a varredura nativa no YouTube.
+// --- ROTA 1: PESQUISA NATIVA ---
 app.get('/search', async (req, res) => {
     const query = req.query.q;
     if (!query) return res.status(400).json({ error: 'Digite o nome da música.' });
 
     try {
-        // Busca a música + "audio" para priorizar faixas oficiais de estúdio
         const r = await yts(query + ' audio');
         const videos = r.videos.slice(0, 15);
 
-        // Formata o resultado exatamente como o seu Player (Front-end) espera ler
         const formattedResults = videos.map(v => ({
             id: v.videoId,
             name: v.title,
             image: [{ quality: '500x500', link: v.thumbnail }],
-            downloadUrl: [{ quality: '320kbps', link: v.videoId }], // Devolve o ID do vídeo
+            downloadUrl: [{ quality: '320kbps', link: v.videoId }],
             artists: { primary: [{ name: v.author.name }] }
         }));
 
@@ -37,14 +33,12 @@ app.get('/search', async (req, res) => {
     }
 });
 
-// --- ROTA 2: STREAMING DE ÁUDIO DIRETO ---
+// --- ROTA 2: STREAMING COM ESCUDO ANTI-CRASH ---
 app.get('/stream', async (req, res) => {
     const urlOrId = req.query.url; 
     if (!urlOrId) return res.status(400).send('ID ausente');
 
-    // Correção do Bug do Jamendo:
-    // Se a requisição já for um link de áudio completo (como as músicas de emergência),
-    // o servidor apenas atua como ponte (proxy) para liberar o CORS para as partículas.
+    // Se for link direto (Músicas de emergência)
     if (urlOrId.startsWith('http')) {
         https.get(urlOrId, (audioStream) => {
             res.writeHead(audioStream.statusCode, {
@@ -52,33 +46,49 @@ app.get('/stream', async (req, res) => {
                 'Access-Control-Allow-Origin': '*'
             });
             audioStream.pipe(res);
-        }).on('error', (err) => {
-            res.status(500).send('Erro ao transmitir link direto.');
+        }).on('error', () => {
+            res.status(500).send('Erro no link direto');
         });
         return;
     }
 
-    // Se for uma música do YouTube (ID), usa o motor ytdl-core
+    // Se for ID do YouTube
+    const videoUrl = `https://www.youtube.com/watch?v=${urlOrId}`;
+
     try {
-        // Extrai o áudio em tempo real com a melhor qualidade
-        const stream = ytdl(urlOrId, {
+        const stream = ytdl(videoUrl, {
             filter: 'audioonly',
-            quality: 'highestaudio'
+            quality: 'highestaudio',
+            highWaterMark: 1 << 25 // Buffer gigante para evitar cortes
         });
 
-        // Envia os cabeçalhos de liberação para o visualizador (Canvas) funcionar
-        res.setHeader('Content-Type', 'audio/mpeg');
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        // Só envia os cabeçalhos de sucesso quando o áudio estiver pronto
+        stream.on('info', () => {
+            if (!res.headersSent) {
+                res.setHeader('Content-Type', 'audio/mpeg');
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                res.setHeader('Transfer-Encoding', 'chunked');
+            }
+        });
 
-        // Transmite a música pedaço por pedaço para o celular do usuário
+        // O ESCUDO: Se o YouTube bloquear o Railway, ele não desliga o servidor!
+        stream.on('error', (err) => {
+            console.error(`[YTDL Bloqueado pelo YouTube] ${urlOrId}:`, err.message);
+            if (!res.headersSent) {
+                res.status(500).send('Servidor impedido de baixar o áudio.');
+            } else {
+                res.end(); // Termina suavemente
+            }
+        });
+
         stream.pipe(res);
     } catch (error) {
-        console.error('Erro ao extrair áudio:', error);
-        res.status(500).send('Erro ao processar o áudio do YouTube');
+        console.error('Catch Error:', error);
+        if (!res.headersSent) res.status(500).send('Erro interno');
     }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Motor Backend Emera (YouTube Nativo) rodando na porta ${PORT}`);
+    console.log(`Backend Emera rodando e blindado na porta ${PORT}`);
 });
