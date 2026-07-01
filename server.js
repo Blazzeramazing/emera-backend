@@ -34,70 +34,71 @@ app.get('/search', async (req, res) => {
     }
 });
 
-// --- FUNÇÃO MÁGICA: TÚNEL NATIVO SEM CRASHES ---
-// Em vez de usar fetch (que guarda ficheiros na memória e crasha o servidor), 
-// esta função faz uma tubagem direta de bytes da origem para o seu frontend.
-function pipeViaNative(url, res) {
+// --- FUNÇÃO MÁGICA: TÚNEL NATIVO (AGORA COM SUPORTE A RANGE) ---
+function pipeViaNative(url, req, res) {
     return new Promise((resolve) => {
         const client = url.startsWith('https') ? https : http;
         
-        const request = client.get(url, { 
-            headers: { 
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Accept': '*/*',
-                'Connection': 'keep-alive'
-            } 
-        }, (streamRes) => {
+        const headers = { 
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Connection': 'keep-alive'
+        };
+
+        // O SEGREDO DE OURO: Repassar o pedido de pedaços (Range) do navegador para a origem!
+        if (req && req.headers && req.headers.range) {
+            headers['Range'] = req.headers.range;
+        }
+
+        const request = client.get(url, { headers: headers }, (streamRes) => {
             // Se houver redirecionamento (muito comum em proxies)
             if (streamRes.statusCode >= 300 && streamRes.statusCode < 400 && streamRes.headers.location) {
                 let redirectUrl = streamRes.headers.location;
-                // Corrigir redirects relativos
                 if (!redirectUrl.startsWith('http')) {
                     const urlObj = new URL(url);
                     redirectUrl = `${urlObj.protocol}//${urlObj.host}${redirectUrl}`;
                 }
-                return resolve(pipeViaNative(redirectUrl, res));
+                return resolve(pipeViaNative(redirectUrl, req, res)); // Chamada recursiva
             }
             
-            // A CORREÇÃO DE OURO: Aceitar 200 (OK) e 206 (Conteúdo Parcial/Música)
+            // Aceitar 200 (OK) e 206 (Conteúdo Parcial/Música)
             if (streamRes.statusCode !== 200 && streamRes.statusCode !== 206) {
-                streamRes.resume(); // Liberta a memória presa
+                streamRes.resume(); 
                 return resolve(false);
             }
             
-            // Proteger contra páginas HTML disfarçadas de áudio
+            // Proteger contra páginas HTML disfarçadas
             const contentType = streamRes.headers['content-type'] || '';
             if (contentType.includes('text/html') || contentType.includes('application/json')) {
                 streamRes.resume();
                 return resolve(false);
             }
 
-            // TUDO VÁLIDO! Iniciar Transmissão CORS
+            // Iniciar Transmissão CORS
             if (!res.headersSent) {
                 res.setHeader('Access-Control-Allow-Origin', '*');
                 res.setHeader('Content-Type', contentType.includes('audio') || contentType.includes('video') ? contentType : 'audio/mpeg');
                 if (streamRes.headers['content-length']) res.setHeader('Content-Length', streamRes.headers['content-length']);
+                
+                // Repassar a confirmação do pedaço (Content-Range) para o navegador não cancelar a ligação
+                if (streamRes.headers['content-range']) res.setHeader('Content-Range', streamRes.headers['content-range']);
+                
                 res.setHeader('Accept-Ranges', 'bytes');
-                res.status(streamRes.statusCode); // Mantém o status original (200 ou 206)
+                res.status(streamRes.statusCode); 
             }
 
-            // Iniciar a tubagem!
             streamRes.pipe(res);
             
-            // Resolver apenas quando o stream terminar, ou ocorrer erro de quebra, 
-            // mas garantir que devolve true porque o envio começou com sucesso.
             streamRes.on('end', () => resolve(true));
             streamRes.on('error', () => resolve(true)); 
         });
         
         request.on('error', () => resolve(false));
-        // Aumentámos a tolerância para 6 segundos para dar tempo a proxies mais distantes
-        request.setTimeout(6000, () => { request.destroy(); resolve(false); });
+        request.setTimeout(8000, () => { request.destroy(); resolve(false); });
     });
 }
 
-// Utilitário de Timeout para as APIs não congelarem o backend
-const fetchWithTimeout = (url, options = {}, timeout = 4000) => {
+const fetchWithTimeout = (url, options = {}, timeout = 5000) => {
     return Promise.race([
         fetch(url, options),
         new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), timeout))
@@ -117,14 +118,13 @@ app.get('/stream', async (req, res) => {
         return res.status(200).end();
     }
 
-    // Se for link direto (emergências do frontend), processa direto
     if (videoId.startsWith('http')) {
-        const success = await pipeViaNative(videoId, res);
+        const success = await pipeViaNative(videoId, req, res);
         if (!success && !res.headersSent) res.redirect(videoId);
         return;
     }
 
-    // LAYER 1: YTDL-CORE (Nativo - Máxima Qualidade)
+    // LAYER 1: YTDL-CORE (Nativo)
     try {
         const info = await Promise.race([
             ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`),
@@ -132,75 +132,52 @@ app.get('/stream', async (req, res) => {
         ]);
         const format = ytdl.chooseFormat(info.formats, { quality: 'highestaudio', filter: 'audioonly' });
         if (format && format.url) {
-            if (await pipeViaNative(format.url, res)) return;
+            if (await pipeViaNative(format.url, req, res)) return;
         }
     } catch (e) {}
 
-    // LAYER 2: COBALT API OFICIAL (Bypass avançado de 2024)
-    try {
-        const cobaltReq = await fetchWithTimeout('https://api.cobalt.tools/api/json', {
-            method: 'POST',
-            headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json',
-                'Origin': 'https://cobalt.tools',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-            },
-            body: JSON.stringify({ url: `https://www.youtube.com/watch?v=${videoId}`, isAudioOnly: true, aFormat: "mp3" })
-        }, 4000);
-
-        if (cobaltReq.ok) {
-            const data = await cobaltReq.json();
-            if (data && data.url) {
-                if (await pipeViaNative(data.url, res)) return;
-            }
-        }
-    } catch(e) {}
-
-    // LAYER 3: INVIDIOUS API (Cluster de Servidores)
+    // LAYER 2: INVIDIOUS API
     const invidiousInstances = [
-        "https://invidious.jing.rocks",
         "https://inv.tux.pizza",
+        "https://invidious.jing.rocks",
         "https://invidious.nerdvpn.de",
-        "https://invidious.no-logs.com",
         "https://invidious.lunar.icu"
     ];
     for (const api of invidiousInstances) {
         try {
-            const req = await fetchWithTimeout(`${api}/api/v1/videos/${videoId}`, {}, 2500);
-            if (!req.ok) continue;
-            const data = await req.json();
+            const reqFetch = await fetchWithTimeout(`${api}/api/v1/videos/${videoId}`, {}, 2500);
+            if (!reqFetch.ok) continue;
+            const data = await reqFetch.json();
             const format = data.formatStreams?.find(s => s.mimeType?.includes('audio/mp4')) || data.formatStreams?.[0];
             if (format && format.url) {
-                if (await pipeViaNative(format.url, res)) return;
+                if (await pipeViaNative(format.url, req, res)) return;
             }
         } catch(e) {}
     }
 
-    // LAYER 4: PIPED API (Última Esperança)
+    // LAYER 3: PIPED API
     const pipedInstances = [
         "https://pipedapi.kavin.rocks",
-        "https://pipedapi.tokhmi.xyz",
         "https://pipedapi.smnz.de",
         "https://piped-api.lunar.icu"
     ];
     for (const api of pipedInstances) {
         try {
-            const req = await fetchWithTimeout(`${api}/streams/${videoId}`, {}, 2500);
-            if (!req.ok) continue;
-            const data = await req.json();
+            const reqFetch = await fetchWithTimeout(`${api}/streams/${videoId}`, {}, 2500);
+            if (!reqFetch.ok) continue;
+            const data = await reqFetch.json();
             const format = data.audioStreams?.find(s => s.mimeType?.includes('audio/mp4')) || data.audioStreams?.[0];
             if (format && format.url) {
-                if (await pipeViaNative(format.url, res)) return;
+                if (await pipeViaNative(format.url, req, res)) return;
             }
         } catch(e) {}
     }
 
-    // SE CHEGAR AQUI, TUDO FALHOU (Envia Erro 500 Oficial)
-    if (!res.headersSent) res.status(500).send('Bloqueio Massivo detectado. Tente novamente mais tarde.');
+    // SE TUDO FALHOU
+    if (!res.headersSent) res.status(500).send('Bloqueio Massivo detectado.');
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Backend TITÃ (Versão Imparável) rodando na porta ${PORT}`);
+    console.log(`Backend TITÃ (Com suporte a Range) rodando na porta ${PORT}`);
 });
