@@ -1,14 +1,18 @@
 const express = require('express');
 const cors = require('cors');
 const yts = require('yt-search');
+const ytdl = require('@distube/ytdl-core');
 
-// Proteção global para o servidor nunca crashar no Railway
+// Proteção Global para evitar Crashes Silenciosos no Railway
 process.on('uncaughtException', (err) => console.error('[CRITICAL] Uncaught Exception:', err.message));
 process.on('unhandledRejection', (reason) => console.error('[CRITICAL] Unhandled Rejection:', reason));
 
 const app = express();
+
+// Permite acesso de qualquer Frontend
 app.use(cors({ origin: '*' }));
 
+// --- ROTA DE PESQUISA ---
 app.get('/search', async (req, res) => {
     const query = req.query.q;
     if (!query) return res.status(400).json({ error: 'Digite o nome da música.' });
@@ -32,138 +36,142 @@ app.get('/search', async (req, res) => {
     }
 });
 
-async function proxyStream(url, req, res, timeoutMs = 3000) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
+// --- FUNÇÃO PROXY OTIMIZADA PARA ÁUDIO ---
+async function proxyStream(url, req, res) {
     try {
         const headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': '*/*',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
         };
+        // Repassa os headers de tempo (seek) se o utilizador avançar a barra
         if (req.headers.range) headers['Range'] = req.headers.range;
 
-        const response = await fetch(url, { headers, redirect: 'follow', signal: controller.signal });
-        clearTimeout(timeoutId); // Limpa o timeout, ligamos ao servidor com sucesso
-
+        const response = await fetch(url, { headers, redirect: 'follow' });
         if (!response.ok) return false;
 
+        // Bloqueia páginas de erro camufladas de 200 OK
         const contentType = response.headers.get('content-type') || '';
-        const contentLength = response.headers.get('content-length');
-
-        // REJEITA PÁGINAS DE ERRO: Só passa ficheiros grandes e do tipo audio/video/stream
-        if (!contentType.includes('audio') && !contentType.includes('video') && !contentType.includes('octet-stream')) {
-            return false;
-        }
-        if (contentLength && parseInt(contentLength) < 50000) {
-            return false; // Menos de 50kb não é música
+        if (contentType.includes('text/html') || contentType.includes('application/json')) {
+            return false; 
         }
 
+        // Passa os cabeçalhos de áudio para o frontend
         res.status(response.status);
-        res.set({
-            'Access-Control-Allow-Origin': '*',
-            'Content-Type': contentType,
-            'Accept-Ranges': 'bytes',
-        });
-        if (contentLength) res.set('Content-Length', contentLength);
-        if (response.headers.get('content-range')) res.set('Content-Range', response.headers.get('content-range'));
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Content-Type', contentType.includes('audio') || contentType.includes('video') ? contentType : 'audio/mpeg');
+        res.setHeader('Accept-Ranges', 'bytes');
+        
+        if (response.headers.get('content-length')) res.setHeader('Content-Length', response.headers.get('content-length'));
+        if (response.headers.get('content-range')) res.setHeader('Content-Range', response.headers.get('content-range'));
 
-        // Tubagem Universal Compatível com versões Node.js mais antigas
-        if (typeof ReadableStream !== 'undefined' && response.body && !response.body.pipe) {
+        // Transmissão por tubagem fluída (sem esgotar a RAM do Railway)
+        if (response.body) {
             const { Readable } = require('stream');
             const stream = Readable.fromWeb(response.body);
             stream.pipe(res);
-            req.on('close', () => stream.destroy());
-        } else if (response.body && typeof response.body.pipe === 'function') {
-            response.body.pipe(res);
-        } else {
-            const buffer = await response.arrayBuffer();
-            res.end(Buffer.from(buffer));
+            
+            req.on('close', () => { stream.destroy(); }); // Para de gastar net se o utilizador trocar de música
+            return true;
         }
-        
-        return true; // Transmissão concluída com sucesso!
+        return false;
     } catch (error) {
-        clearTimeout(timeoutId);
+        console.error('[Proxy] Erro na transmissão:', error.message);
         return false;
     }
 }
 
+// --- ROTA DE REPRODUÇÃO (O REDIRECTOR INTELIGENTE) ---
 app.get('/stream', async (req, res) => {
     const videoId = req.query.url; 
     if (!videoId) return res.status(400).send('ID ausente');
 
-    // Headers baseados CORS (sempre injetados para evitar erros no frontend)
+    // Headers baseados CORS (sempre injetados primeiro para o browser não dar block)
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
     if (req.method === 'OPTIONS') return res.status(200).end();
 
     if (videoId.startsWith('http')) {
-        if (await proxyStream(videoId, req, res, 5000)) return;
+        if (await proxyStream(videoId, req, res)) return;
         return res.redirect(videoId);
     }
 
-    console.log(`\n=== NOVA TENTATIVA DE ÁUDIO: ${videoId} ===`);
+    console.log(`\n=== TOCAR ÁUDIO: ${videoId} ===`);
 
-    // CAMADA 1: INVIDIOUS PROXY (A mais robusta, força local=true)
-    const invidiousInstances = [
-        "https://invidious.jing.rocks",
-        "https://inv.tux.pizza",
-        "https://invidious.lunar.icu",
-        "https://invidious.projectsegfau.lt",
-        "https://inv.rvt.wtf",
-        "https://invidious.privacydev.net"
-    ];
-
-    for (const instance of invidiousInstances) {
-        const targetUrl = `${instance}/latest_version?id=${videoId}&itag=140&local=true`;
-        if (await proxyStream(targetUrl, req, res, 2500)) return;
-    }
-
-    // CAMADA 2: PIPED API (Com timeout super rápido de 2s para não encravar)
-    const pipedInstances = [
-        'https://pipedapi.kavin.rocks',
-        'https://pipedapi.tokhmi.xyz',
-        'https://pipedapi.smnz.de'
-    ];
-
-    for (const api of pipedInstances) {
-        try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 2000);
-            
-            const response = await fetch(`${api}/streams/${videoId}`, { signal: controller.signal });
-            clearTimeout(timeoutId);
-
-            if (!response.ok) continue;
-            const data = await response.json();
-            const bestAudio = data.audioStreams.find(s => s.mimeType && s.mimeType.includes('audio/mp4')) || data.audioStreams[0];
-
-            if (bestAudio && bestAudio.url) {
-                if (await proxyStream(bestAudio.url, req, res, 3000)) return;
-            }
-        } catch (err) { }
-    }
-
-    // CAMADA 3: YTDL-CORE NATIVO (Se estiver instalado via package.json, atua como último recurso)
+    // CAMADA 1: YTDL-CORE NATIVO (Prioridade Absoluta - Rápido e Sem Limites)
     try {
-        const ytdl = require('@distube/ytdl-core');
+        console.log('[1] A extrair via ytdl-core...');
         const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`);
         const format = ytdl.chooseFormat(info.formats, { quality: 'highestaudio', filter: 'audioonly' });
         
         if (format && format.url) {
-            if (await proxyStream(format.url, req, res, 4000)) return; 
+            console.log('[1] Sucesso! Iniciando a tubagem...');
+            const success = await proxyStream(format.url, req, res);
+            if (success) return; 
         }
-    } catch (err) { }
+    } catch (err) { 
+        console.error('[1] Falha ytdl-core:', err.message);
+    }
+
+    // CAMADA 2: COBALT API (O Melhor Proxy Público de 2024)
+    try {
+        console.log('[2] A extrair via Cobalt API...');
+        const cobaltReq = await fetch('https://api.cobalt.tools/api/json', {
+            method: 'POST',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'User-Agent': 'EmeraPlayer/1.0'
+            },
+            body: JSON.stringify({
+                url: `https://www.youtube.com/watch?v=${videoId}`,
+                vQuality: 'audio',
+                isAudioOnly: true,
+                aFormat: 'mp3'
+            })
+        });
+
+        if (cobaltReq.ok) {
+            const data = await cobaltReq.json();
+            if (data && data.url) {
+                console.log('[2] Redirecionando para servidor Cobalt...');
+                return res.redirect(data.url);
+            }
+        }
+    } catch (err) {
+        console.error('[2] Falha Cobalt:', err.message);
+    }
+
+    // CAMADA 3: PIPED API DE EMERGÊNCIA (Timeout Rápido)
+    try {
+        console.log(`[3] Testando Piped API...`);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 4000); // Se não responder em 4s, aborta
+        
+        const response = await fetch(`https://pipedapi.kavin.rocks/streams/${videoId}`, { signal: controller.signal });
+        clearTimeout(timeoutId);
+
+        if (response.ok) {
+            const data = await response.json();
+            const bestAudio = data.audioStreams?.find(s => s.mimeType && s.mimeType.includes('audio/mp4')) || data.audioStreams?.[0];
+
+            if (bestAudio && bestAudio.url) {
+                console.log('[3] A fazer proxy pelo Piped...');
+                const success = await proxyStream(bestAudio.url, req, res);
+                if (success) return;
+            }
+        }
+    } catch (err) {
+        console.error(`[3] Falha Piped:`, err.message);
+    }
 
     // SE CHEGAR AQUI, TUDO FALHOU.
-    console.log(`[ERRO FATAL] Todas as 3 camadas falharam para o ID: ${videoId}`);
+    console.log(`[ERRO FATAL] Bloqueio total para o ID: ${videoId}`);
     if (!res.headersSent) {
-        res.status(500).send('Erro Crítico: Nenhum proxy suportou este vídeo. O IP pode estar bloqueado.');
+        res.status(500).send('Erro Crítico: Bloqueio de IP detectado pelo YouTube.');
     }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Backend Supremo (Limpo e Estável) rodando na porta ${PORT}`);
+    console.log(`Backend Supremo (Sem Demoras) rodando na porta ${PORT}`);
 });
