@@ -42,19 +42,35 @@ function pipeViaNative(url, res) {
         const client = url.startsWith('https') ? https : http;
         
         const request = client.get(url, { 
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' } 
+            headers: { 
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Accept': '*/*',
+                'Connection': 'keep-alive'
+            } 
         }, (streamRes) => {
             // Se houver redirecionamento (muito comum em proxies)
             if (streamRes.statusCode >= 300 && streamRes.statusCode < 400 && streamRes.headers.location) {
-                return resolve(pipeViaNative(streamRes.headers.location, res));
+                let redirectUrl = streamRes.headers.location;
+                // Corrigir redirects relativos
+                if (!redirectUrl.startsWith('http')) {
+                    const urlObj = new URL(url);
+                    redirectUrl = `${urlObj.protocol}//${urlObj.host}${redirectUrl}`;
+                }
+                return resolve(pipeViaNative(redirectUrl, res));
             }
             
-            // Se não for código 200 (Sucesso), rejeitar na hora! (Evita banimento)
-            if (streamRes.statusCode !== 200) return resolve(false);
+            // A CORREÇÃO DE OURO: Aceitar 200 (OK) e 206 (Conteúdo Parcial/Música)
+            if (streamRes.statusCode !== 200 && streamRes.statusCode !== 206) {
+                streamRes.resume(); // Liberta a memória presa
+                return resolve(false);
+            }
             
             // Proteger contra páginas HTML disfarçadas de áudio
             const contentType = streamRes.headers['content-type'] || '';
-            if (contentType.includes('text/html') || contentType.includes('application/json')) return resolve(false);
+            if (contentType.includes('text/html') || contentType.includes('application/json')) {
+                streamRes.resume();
+                return resolve(false);
+            }
 
             // TUDO VÁLIDO! Iniciar Transmissão CORS
             if (!res.headersSent) {
@@ -62,15 +78,21 @@ function pipeViaNative(url, res) {
                 res.setHeader('Content-Type', contentType.includes('audio') || contentType.includes('video') ? contentType : 'audio/mpeg');
                 if (streamRes.headers['content-length']) res.setHeader('Content-Length', streamRes.headers['content-length']);
                 res.setHeader('Accept-Ranges', 'bytes');
+                res.status(streamRes.statusCode); // Mantém o status original (200 ou 206)
             }
 
+            // Iniciar a tubagem!
             streamRes.pipe(res);
-            resolve(true); // Resolve instantaneamente assim que começa a tubagem
+            
+            // Resolver apenas quando o stream terminar, ou ocorrer erro de quebra, 
+            // mas garantir que devolve true porque o envio começou com sucesso.
+            streamRes.on('end', () => resolve(true));
+            streamRes.on('error', () => resolve(true)); 
         });
         
         request.on('error', () => resolve(false));
-        // Se demorar mais de 4 segundos a conectar, mata o processo para não prender a app
-        request.setTimeout(4000, () => { request.destroy(); resolve(false); });
+        // Aumentámos a tolerância para 6 segundos para dar tempo a proxies mais distantes
+        request.setTimeout(6000, () => { request.destroy(); resolve(false); });
     });
 }
 
